@@ -225,12 +225,41 @@ function requestStream(){
 async function ensureMic(){
   if(recNode)return;
   await requestStream();
-  if(!ctx.audioWorklet)throw new Error('This browser has no AudioWorklet. Update iOS.');
-  await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET],{type:'text/javascript'})));
-  const src=ctx.createMediaStreamSource(micStream);
-  recNode=new AudioWorkletNode(ctx,'rec-proc',{numberOfInputs:1,numberOfOutputs:1,outputChannelCount:[1]});
-  const mute=ctx.createGain();mute.gain.value=0;
-  src.connect(recNode);recNode.connect(mute);mute.connect(ctx.destination);
+  let stage='source';
+  try{
+    const tr=micStream.getAudioTracks();
+    if(!tr.length||tr[0].readyState!=='live'){micP=null;micStream=null;throw new Error('microphone stream is not live, try again');}
+    const src=ctx.createMediaStreamSource(micStream);
+    const mute=ctx.createGain();mute.gain.value=0;
+    let node=null;
+    try{
+      stage='worklet';
+      if(!ctx.audioWorklet)throw new Error('no AudioWorklet');
+      await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET],{type:'text/javascript'})));
+      node=new AudioWorkletNode(ctx,'rec-proc',{numberOfInputs:1,numberOfOutputs:1,outputChannelCount:[1]});
+      src.connect(node);node.connect(mute);
+    }catch(we){
+      /* Fallback for browsers where AudioWorklet fails: ScriptProcessor capture. */
+      stage='scriptprocessor';
+      let on=false;
+      const sp=ctx.createScriptProcessor(2048,1,1);
+      node={port:{onmessage:null,postMessage(m){
+        if(m==='start')on=true;
+        else if(m==='stop'){on=false;setTimeout(()=>node.port.onmessage&&node.port.onmessage({data:{end:true}}),0);}
+      }}};
+      sp.onaudioprocess=e=>{
+        if(!on||!node.port.onmessage)return;
+        const d=new Float32Array(e.inputBuffer.getChannelData(0));
+        const f=Math.round(e.playbackTime*ctx.sampleRate)-2*2048;
+        node.port.onmessage({data:{f,d}});
+      };
+      src.connect(sp);sp.connect(mute);
+    }
+    mute.connect(ctx.destination);
+    recNode=node;
+  }catch(e){
+    throw new Error(`Mic setup failed at ${stage}: ${e.name||'Error'} ${e.message||''}`.trim());
+  }
   recNode.port.onmessage=e=>{
     const m=e.data,r=T.rec;
     if(m.end){if(r&&r.stopping)finalize(r);return;}
