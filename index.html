@@ -205,17 +205,27 @@ function nodesFor(t){
   if(!t.gain){t.gain=ctx.createGain();t.gain.connect(master);applyGain(t);}
   if(t.raw&&!t.buf)makeBuf(t);
 }
+let micP=null;
+/* Must be called synchronously from the tap so iOS shows the permission prompt. */
+function requestStream(){
+  if(micP)return micP;
+  if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia)
+    return Promise.reject(new Error('No microphone API here. Open Loopstack directly in Safari (not inside another app) over HTTPS.'));
+  micP=navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}})
+    .then(s=>{micStream=s;return s;})
+    .catch(e=>{
+      micP=null;
+      const n=e&&e.name||'error';
+      throw new Error(n==='NotAllowedError'
+        ?'Microphone blocked (NotAllowedError). In Safari tap aA > Website Settings > Microphone > Allow, then reload.'
+        :`Could not open the microphone (${n}).`);
+    });
+  return micP;
+}
 async function ensureMic(){
   if(recNode)return;
-  if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia||!ctx.audioWorklet)
-    throw new Error('This browser cannot record audio. Open Loopstack in Safari over HTTPS.');
-  try{
-    micStream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
-  }catch(e){
-    throw new Error(e&&e.name==='NotAllowedError'
-      ?'Microphone blocked. Allow it for this site in Settings > Safari > Microphone, then try again.'
-      :'Could not open the microphone.');
-  }
+  await requestStream();
+  if(!ctx.audioWorklet)throw new Error('This browser has no AudioWorklet. Update iOS.');
   await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET],{type:'text/javascript'})));
   const src=ctx.createMediaStreamSource(micStream);
   recNode=new AudioWorkletNode(ctx,'rec-proc',{numberOfInputs:1,numberOfOutputs:1,outputChannelCount:[1]});
@@ -286,7 +296,10 @@ async function armRec(t){
     if(T.rec.track===t&&!T.rec.stopping&&ctx.currentTime<T.rec.we)cancelRec();
     return;
   }
-  try{await ensureAudio();await ensureMic();}catch(e){toast(e.message);return;}
+  const audioP=ensureAudio();
+  const micReq=recNode?null:requestStream();
+  if(micReq)micReq.catch(()=>{});
+  try{await audioP;await ensureMic();}catch(e){toast(e.message);return;}
   if(T.rec)return;
   const L=loopLen();
   if(!T.playing)startTransport(state.countIn?1:0);
